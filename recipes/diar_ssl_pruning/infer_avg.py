@@ -173,6 +173,16 @@ if __name__ == "__main__":
         help="Path to pretrained segmentation model.",
     )
 
+    parser.add_argument(
+        "--gpu_id",
+        type=int,
+        default=None,
+        help=(
+            "CUDA device index for inference. Defaults to cuda:0 when CUDA is "
+            "available, otherwise CPU."
+        ),
+    )
+
     # Inference parameters
     parser.add_argument(
         "--seg_duration",
@@ -265,6 +275,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(args)
 
+    if torch.cuda.is_available():
+        gpu_id = 0 if args.gpu_id is None else args.gpu_id
+        visible_cuda_devices = torch.cuda.device_count()
+        if not 0 <= gpu_id < visible_cuda_devices:
+            parser.error(
+                f"--gpu_id {gpu_id} is invalid: "
+                f"only {visible_cuda_devices} CUDA device(s) are visible."
+            )
+        device = torch.device(f"cuda:{gpu_id}")
+    else:
+        if args.gpu_id is not None:
+            parser.error(
+                f"--gpu_id {args.gpu_id} was provided, but CUDA is unavailable."
+            )
+        device = torch.device("cpu")
+
+    print(f"Using inference device: {device}")
+
     config_path = Path(args.configuration).expanduser().absolute()
     config = toml.load(config_path.as_posix())
     
@@ -299,7 +327,7 @@ if __name__ == "__main__":
         clustering=args.clustering_method,
         embedding_batch_size=args.batch_size,
         segmentation_batch_size=args.batch_size,
-        device=torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        device=device
     )
 
     if args.clustering_method == "AgglomerativeClustering":
