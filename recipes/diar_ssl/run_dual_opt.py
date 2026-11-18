@@ -131,7 +131,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        help="Checkpoint path for fine-tuning.",
+        help="Model checkpoint file for fine-tuning.",
     )
 
     args = parser.parse_args()
@@ -141,5 +141,20 @@ if __name__ == "__main__":
 
     config["meta"]["exp_id"] = config_path.stem
     config["meta"]["config_path"] = config_path.as_posix()
+
+    if args.finetune:
+        if not args.ckpt_path:
+            parser.error("--ckpt_path is required with --finetune")
+
+        ckpt_path = Path(args.ckpt_path).expanduser().absolute()
+        if not ckpt_path.is_file():
+            parser.error(f"Fine-tune checkpoint file not found: {ckpt_path}")
+
+        config.setdefault("finetune", {}).update(
+            finetune=True,
+            ckpt_dir=ckpt_path.as_posix(),
+        )
+    elif args.ckpt_path:
+        parser.error("--ckpt_path requires --finetune")
 
     run(config, args.resume)
