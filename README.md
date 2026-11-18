@@ -1,4 +1,9 @@
 # DiariZen
+
+For the independently runnable training stages, consolidated datasets,
+checkpoint preparation, evaluation, and restart instructions added on this
+branch, see the [training and evaluation restart guide](docs/SPLIT_TRAIN_STAGES.md).
+
 DiariZen is a speaker diarization toolkit driven by [AudioZen](https://github.com/haoxiangsnr/spiking-fullsubnet) and [Pyannote 3.1](https://huggingface.co/pyannote/speaker-diarization-3.1). 
 
 

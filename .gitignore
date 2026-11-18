@@ -149,3 +149,23 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Local training/evaluation artifacts (source and configs stay versioned)
+/pretrained/
+/recipes/diar_ssl/data/DiariZen_all/
+/recipes/diar_ssl_pruning/data/DiariZen_all/
+/recipes/diar_ssl/output/
+/recipes/diar_ssl_pruning/output/
+/recipes/diar_ssl/data/**/wav.scp.bak
+/recipes/diar_ssl_pruning/.stage2-config.*/
+/recipes/diar_ssl_pruning/.stage3-config.*/
+/lr_decay.patch
+
+# ONNX sources are versioned; downloaded/generated model artifacts are not.
+/runtime/cache/
+/runtime/*.onnx
+/runtime/*.onnx.data
+/runtime/*.metadata.json
+/runtime/*.validation*.json
+# The older exp* pattern also matches this source filename.
+!/runtime/export_segmentation_onnx.py
