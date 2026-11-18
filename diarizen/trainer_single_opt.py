@@ -84,8 +84,11 @@ class Trainer:
 
         self.lr_decay = self.trainer_config.get("lr_decay", False)
         self.lr_decay_patience = self.trainer_config.get("lr_decay_patience", 2)
+        self.lr_decay_factor = self.trainer_config.get("lr_decay_factor", 0.95)
+        self.lr_decay_min_lr = self.trainer_config.get("lr_decay_min_lr", 1e-8)
 
         self.use_one_cycle_lr = self.trainer_config.get("use_one_cycle_lr", False)
+        self.one_cycle_pct_start = self.trainer_config.get("one_cycle_pct_start", 0.3)
 
         self.gradient_percentile = self.trainer_config.get("gradient_percentile", 10)
         self.gradient_history_size = self.trainer_config.get("gradient_history_size", 1000)
@@ -325,17 +328,18 @@ class Trainer:
         self.lr_decay_scheduler = ReduceLROnPlateau(
             optimizer=self.optimizer,
             mode='min',
-            factor=0.95,
+            factor=self.lr_decay_factor,
             patience=self.lr_decay_patience,
-            min_lr=1e-8
+            min_lr=self.lr_decay_min_lr
         )
-        self.lr_decay_scheduler = self.accelerator.prepare(self.lr_decay_scheduler)
+        self.accelerator.register_for_checkpointing(self.lr_decay_scheduler)
 
     def create_lr_one_cycle_scheduler(self, max_steps):
         self.lr_one_cycle_scheduler = OneCycleLR(
             optimizer=self.optimizer,
             max_lr=self.get_optimizer_lr(self.optimizer),
-            total_steps=max_steps
+            total_steps=max_steps,
+            pct_start=self.one_cycle_pct_start,
         )
         self.lr_one_cycle_scheduler = self.accelerator.prepare(self.lr_one_cycle_scheduler)
 
@@ -405,6 +409,8 @@ class Trainer:
             self.create_schedulers(max_steps=max_steps)
         if self.use_one_cycle_lr:
             self.create_lr_one_cycle_scheduler(max_steps=max_steps * self.accelerator.num_processes)
+        if self.lr_decay:
+            self.create_lr_decay_scheduler()
 
         # Resume
         if self.resume:
@@ -470,10 +476,15 @@ class Trainer:
                     logger.info("Training finished, begin validation...")
                     score = self.validate(validation_dataloader)
 
-                    if self.accelerator.is_local_main_process:
+                    if self.lr_decay:
+                        score_tensor = torch.tensor(
+                            score if self.accelerator.is_main_process else 0.0,
+                            device=self.device,
+                        )
+                        score = self.accelerator.reduce(score_tensor, reduction="sum").item()
+                        self.lr_decay_scheduler.step(score)
 
-                        if self.lr_decay:
-                            self.lr_decay_scheduler.step(score)
+                    if self.accelerator.is_local_main_process:
 
                         should_stop = self._run_early_stop_check(score)
                         if should_stop:

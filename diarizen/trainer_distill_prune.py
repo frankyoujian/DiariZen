@@ -86,8 +86,11 @@ class Trainer:
 
         self.lr_decay = self.trainer_config.get("lr_decay", False)
         self.lr_decay_patience = self.trainer_config.get("lr_decay_patience", 2)
+        self.lr_decay_factor = self.trainer_config.get("lr_decay_factor", 0.95)
+        self.lr_decay_min_lr = self.trainer_config.get("lr_decay_min_lr", 1e-8)
 
         self.use_one_cycle_lr = self.trainer_config.get("use_one_cycle_lr", False)
+        self.one_cycle_pct_start = self.trainer_config.get("one_cycle_pct_start", 0.3)
 
         self.gradient_percentile = self.trainer_config.get("gradient_percentile", 10)
         self.gradient_history_size = self.trainer_config.get("gradient_history_size", 1000)
@@ -229,6 +232,14 @@ class Trainer:
 
         return ckpt_path
 
+    @staticmethod
+    def _is_legacy_checkpoint_without_lr_decay_scheduler(ckpt_path):
+        """Check for checkpoints saved before the plateau scheduler was registered."""
+        custom_state_files = sorted(
+            path.name for path in Path(ckpt_path).glob("custom_checkpoint_*.pkl")
+        )
+        return custom_state_files == ["custom_checkpoint_0.pkl"]
+
     def _load_checkpoint(self, ckpt_path):
         """load a checkpoint from the checkpints directory.
 
@@ -340,17 +351,18 @@ class Trainer:
         self.lr_decay_scheduler = ReduceLROnPlateau(
             optimizer=self.optimizer,
             mode='min',
-            factor=0.95,
+            factor=self.lr_decay_factor,
             patience=self.lr_decay_patience,
-            min_lr=1e-8
+            min_lr=self.lr_decay_min_lr
         )
-        self.lr_decay_scheduler = self.accelerator.prepare(self.lr_decay_scheduler)
+        self.accelerator.register_for_checkpointing(self.lr_decay_scheduler)
 
     def create_lr_one_cycle_scheduler(self, max_steps):
         self.lr_one_cycle_scheduler = OneCycleLR(
             optimizer=self.optimizer,
             max_lr=self.get_optimizer_lr(self.optimizer),
-            total_steps=max_steps
+            total_steps=max_steps,
+            pct_start=self.one_cycle_pct_start,
         )
         self.lr_one_cycle_scheduler = self.accelerator.prepare(self.lr_one_cycle_scheduler)
 
@@ -419,15 +431,46 @@ class Trainer:
         logger.info(f"`max_steps`: {max_steps}")
         logger.info(f"`max_epochs`: {max_epochs}")
 
+        resume_checkpoint = self._find_latest_ckpt_path() if self.resume else None
+        legacy_lr_decay_checkpoint = (
+            self.lr_decay
+            and resume_checkpoint is not None
+            and self._is_legacy_checkpoint_without_lr_decay_scheduler(
+                resume_checkpoint
+            )
+        )
+
         # Generator learning rate scheduler
         if self.warmup_steps > 0:
-            self.create_schedulers(warmup_steps=self.warmup_steps, max_steps=max_steps)
+            self.create_schedulers(max_steps=max_steps)
         if self.use_one_cycle_lr:
             self.create_lr_one_cycle_scheduler(max_steps=max_steps * self.accelerator.num_processes)
+        if self.lr_decay and not legacy_lr_decay_checkpoint:
+            self.create_lr_decay_scheduler()
 
         # Resume
         if self.resume:
-            self._load_checkpoint(ckpt_path="latest")
+            self._load_checkpoint(ckpt_path=resume_checkpoint)
+        if legacy_lr_decay_checkpoint:
+            self.create_lr_decay_scheduler()
+            if self.accelerator.is_local_main_process:
+                logger.warning(
+                    "Loaded a legacy checkpoint without lr-decay scheduler state; "
+                    "initialized a fresh ReduceLROnPlateau scheduler."
+                )
+
+        # Validation loss is expected to worsen while the sparsity target is
+        # ramping up. Do not carry that deliberately non-stationary history
+        # into the fixed-sparsity plateau schedule when resuming a warmup
+        # checkpoint.
+        if (
+            self.resume
+            and self.lr_decay
+            and self.state.epochs_trained <= self.sparsity_warmup_epochs
+        ):
+            self.lr_decay_scheduler._reset()
+            if self.accelerator.is_local_main_process:
+                logger.info("Reset ReduceLROnPlateau state after sparsity warmup checkpoint resume.")
 
         # validation 0 epoch performance
         if self.validation_before_training:
@@ -495,10 +538,18 @@ class Trainer:
                     logger.info("Training finished, begin validation...")
                     score = self.validate(validation_dataloader)
 
-                    if self.accelerator.is_local_main_process:
+                    if (
+                        self.lr_decay
+                        and self.state.epochs_trained > self.sparsity_warmup_epochs
+                    ):
+                        score_tensor = torch.tensor(
+                            score if self.accelerator.is_main_process else 0.0,
+                            device=self.device,
+                        )
+                        score = self.accelerator.reduce(score_tensor, reduction="sum").item()
+                        self.lr_decay_scheduler.step(score)
 
-                        if self.lr_decay:
-                            self.lr_decay_scheduler.step(score)
+                    if self.accelerator.is_local_main_process:
 
                         if self.apply_early_stop:
                             should_stop = self._run_early_stop_check(score)

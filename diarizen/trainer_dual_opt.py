@@ -86,6 +86,8 @@ class Trainer:
 
         self.lr_decay = self.trainer_config.get("lr_decay", False)
         self.lr_decay_patience = self.trainer_config.get("lr_decay_patience", 2)
+        self.lr_decay_factor = self.trainer_config.get("lr_decay_factor", 0.95)
+        self.lr_decay_min_lr = self.trainer_config.get("lr_decay_min_lr", 1e-8)
 
         self.use_one_cycle_lr = self.trainer_config.get("use_one_cycle_lr", False)
 
@@ -331,20 +333,19 @@ class Trainer:
         self.lr_decay_scheduler_small = ReduceLROnPlateau(
             optimizer=self.optimizer_small,
             mode='min',
-            factor=0.95,
+            factor=self.lr_decay_factor,
             patience=self.lr_decay_patience,
-            min_lr=1e-8
+            min_lr=self.lr_decay_min_lr
         )
         self.lr_decay_scheduler_big = ReduceLROnPlateau(
             optimizer=self.optimizer_big,
             mode='min',
-            factor=0.95,
+            factor=self.lr_decay_factor,
             patience=self.lr_decay_patience,
-            min_lr=1e-8
+            min_lr=self.lr_decay_min_lr
         )
-        self.lr_decay_scheduler_small, self.lr_decay_scheduler_big = self.accelerator.prepare(
-            self.lr_decay_scheduler_small, self.lr_decay_scheduler_big
-        )
+        self.accelerator.register_for_checkpointing(self.lr_decay_scheduler_small)
+        self.accelerator.register_for_checkpointing(self.lr_decay_scheduler_big)
 
     def create_lr_one_cycle_scheduler(self, max_steps):
         self.lr_one_cycle_scheduler_small = OneCycleLR(
@@ -427,6 +428,8 @@ class Trainer:
             self.create_schedulers(max_steps=max_steps)
         if self.use_one_cycle_lr:
             self.create_lr_one_cycle_scheduler(max_steps=max_steps * self.accelerator.num_processes)
+        if self.lr_decay:
+            self.create_lr_decay_scheduler()
 
         # Resume
         if self.resume:
@@ -484,26 +487,29 @@ class Trainer:
             self.state.epochs_trained += 1
             self.training_epoch_end(training_epoch_output)
 
-            # Should save, evaluate, and early stop?
-            if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
-                self._save_checkpoint(epoch, is_best_epoch=False)
-    
             if epoch % self.validation_interval == 0:
                 with torch.no_grad():
                     logger.info("Training finished, begin validation...")
                     score = self.validate(validation_dataloader)
 
+                    if self.lr_decay:
+                        score_tensor = torch.tensor(
+                            score if self.accelerator.is_main_process else 0.0,
+                            device=self.device,
+                        )
+                        score = self.accelerator.reduce(score_tensor, reduction="sum").item()
+                        self.lr_decay_scheduler_small.step(score)
+                        self.lr_decay_scheduler_big.step(score)
+
                     if self.accelerator.is_local_main_process:
-
-                        if self.lr_decay:
-                            self.lr_decay_scheduler_small.step(score)
-                            self.lr_decay_scheduler_big.step(score)
-
                         should_stop = self._run_early_stop_check(score)
                         if should_stop:
                             early_stop_mark += 1
-                    
+
                     logger.info("Validation finished.")
+
+            if self.accelerator.is_local_main_process and epoch % self.save_ckpt_interval == 0:
+                self._save_checkpoint(epoch, is_best_epoch=False)
 
             self.accelerator.wait_for_everyone()
 

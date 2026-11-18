@@ -57,7 +57,8 @@ def _gen_chunk_indices(
     init_posi = int(init_posi + 1)
     data_len = int(data_len - 1)
     cur_len = data_len - init_posi
-    assert cur_len > size
+    if cur_len < size:
+        return
     num_chunks = int((cur_len - size + step) / step)
     
     for i in range(num_chunks):
@@ -120,23 +121,26 @@ class DiarizationDataset(Dataset):
         self.model_num_frames = model_num_frames
         
         self.rec_scp = load_scp(scp_file)
+        self.session_to_idx = {
+            session: index for index, session in enumerate(self.rec_scp)
+        }
         self.reco2dur = load_uem(uem_file)
         
         for rec, dur_info in self.reco2dur.items():
-            start_sec, end_sec = dur_info   
-            try:
-                if chunk_size > 0:
-                    for st, ed in _gen_chunk_indices(
-                            start_sec,
-                            end_sec,
-                            chunk_size,
-                            chunk_shift
-                    ):
-                        self.chunk_indices.append((rec, self.rec_scp[rec], st, ed))      # seconds
-                else:
-                    self.chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))
-            except:
-                print(f'Un-matched recording: {rec}')
+            if rec not in self.rec_scp:
+                raise KeyError(f"UEM recording {rec!r} is missing from {scp_file}")
+
+            start_sec, end_sec = dur_info
+            if chunk_size > 0:
+                for st, ed in _gen_chunk_indices(
+                        start_sec,
+                        end_sec,
+                        chunk_size,
+                        chunk_shift
+                ):
+                    self.chunk_indices.append((rec, self.rec_scp[rec], st, ed))      # seconds
+            else:
+                self.chunk_indices.append((rec, self.rec_scp[rec], start_sec, end_sec))
                 
         self.annotations = self.rttm2label(rttm_file)
 
@@ -144,15 +148,17 @@ class DiarizationDataset(Dataset):
         """
         convert session to session idex
         """
-        session_keys = list(self.rec_scp.keys())
-        return session_keys.index(session)
+        try:
+            return self.session_to_idx[session]
+        except KeyError as error:
+            raise KeyError(f"RTTM recording {session!r} is missing from wav.scp") from error
             
     def rttm2label(self, rttm_file):
         '''
         SPEAKER train100_306 1 15.71 1.76 <NA> <NA> 5456 <NA> <NA>
         '''
         annotations = []
-        session_lst = []
+        session_label_maps = {}
         with open(rttm_file, 'r') as file:
             for seg_idx, line in enumerate(file):   
                 line = line.split()
@@ -162,15 +168,10 @@ class DiarizationDataset(Dataset):
                 end = start + float(dur)
                 spk = line[-2] if line[-2] != "<NA>" else line[-3]
                 
-                # new nession
-                if session not in session_lst:      
-                    unique_label_lst = []
-                    session_lst.append(session)
-                    
-                if spk not in unique_label_lst:
-                    unique_label_lst.append(spk)
-                    
-                label_idx = unique_label_lst.index(spk)
+                session_labels = session_label_maps.setdefault(session, {})
+                if spk not in session_labels:
+                    session_labels[spk] = len(session_labels)
+                label_idx = session_labels[spk]
                 
                 annotations.append(
                     (
@@ -193,7 +194,7 @@ class DiarizationDataset(Dataset):
         
         return np.array(annotations, dtype=segment_dtype)
 
-    def extract_wavforms(self, path, start, end, num_channels=8):
+    def extract_wavforms(self, path, start, end, num_channels=1):
         start = int(start * self.sample_rate)
         end = int(end * self.sample_rate)
         data, sample_rate = sf.read(path, start=start, stop=end)
