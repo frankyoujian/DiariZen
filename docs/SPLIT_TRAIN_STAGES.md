@@ -48,6 +48,45 @@ The backbone-only artifacts contain no Conformer/classifier. Pruning stages
 representations on that audio, without the segmentation head. Stage 3 restores
 supervised segmentation training with RTTM labels.
 
+### Training stages and checkpoint handoffs
+
+The workflow trains a full WavLM–Conformer diarizer, then compresses its WavLM
+backbone through two rounds of distillation. Pruning stage 3 combines the compact
+WavLM from stage 2 with the segmentation head from the full fine-tuned model and
+trains both on labeled audio. The average directory names in the diagram
+identify the historical runs.
+
+![Checkpoint handoffs from WavLM-Base+ through full-model training, pruning, compact fine-tuning and RTTM inference](assets/training-flow/training-flow.png)
+
+Stages **1-2** and **2-2** process checkpoints without gradient updates. They
+select the lowest development-loss checkpoints from the peak development-loss
+epoch onward, including that epoch, with a configurable cap of five by default.
+Stage 1-2 applies the learned gates to shrink the architecture. Stage 2-2
+exports the further-distilled student in the same compact architecture.
+
+### Supervised segmentation model
+
+Full steps 1 and 2 and pruning stage 3 share this forward path. The segmentation
+head includes every learned module from the layer mix through the classifier.
+
+![Supervised segmentation model from waveform through WavLM and the trainable head to frame-level powerset scores and loss](assets/training-flow/supervised-segmentation-model.png)
+
+The head trains in all three supervised steps. WavLM is frozen in full step 1,
+then updated alongside the head in full step 2 and pruning stage 3.
+
+### WavLM distillation model
+
+![Frozen WavLM teacher and trainable student matching hidden states, with a sparsity loss for stage 1-1 gates](assets/training-flow/wavlm-distillation-model.png)
+
+The teacher's hidden states provide supervision in both distillation stages. The
+dataset loader reads RTTM and UEM metadata, while the distillation loss uses the
+waveform-derived features.
+
+In the historical run, compaction reduced WavLM from **94.38M to 18.88M
+parameters** and from **144 to 21 attention heads**. The compact backbone
+retains **12 Transformer blocks and a 768-wide output**, so stage 3 can reuse
+the full model's layer mix, projection, normalization, Conformer and classifier.
+
 ## 2. Rebuild the environment
 
 ```bash
