@@ -48,6 +48,100 @@ The backbone-only artifacts contain no Conformer/classifier. Pruning stages
 representations on that audio, without the segmentation head. Stage 3 restores
 supervised segmentation training with RTTM labels.
 
+### Training stages and checkpoint handoffs
+
+The workflow trains a full WavLM–Conformer diarizer, then compresses its WavLM
+backbone through two rounds of distillation. Pruning stage 3 combines the compact
+WavLM from stage 2 with the segmentation head from the full fine-tuned model and
+trains both on labeled audio. The average directory names in the diagram
+identify the historical runs.
+
+```mermaid
+flowchart TD
+    MS["Microsoft WavLM-Base+.pt"] -->|Convert| BOOT["WavLM-Base+.diarizen.pt<br/>Backbone architecture and weights"]
+    BOOT --> F1["Full step 1 · Supervised segmentation<br/>Frozen WavLM · trainable segmentation head"]
+    F1 -->|Average five selected epochs| A1["Full segmentation checkpoint<br/>average_64_65_69_70_72"]
+    A1 --> F2["Full step 2 · Supervised fine-tuning<br/>Trainable WavLM and segmentation head"]
+    F2 -->|Average five selected epochs| A2["Full fine-tuned checkpoint<br/>average_32_33_35_36_37"]
+
+    A2 -->|Extract WavLM weights| W["wavlm_model.pt<br/>Fine-tuned dense backbone"]
+    W -->|Initialize teacher and student| P11["Pruning 1-1 · Distill and learn gates<br/>Frozen teacher · trainable student and gates"]
+    P11 --> P12["Pruning 1-2 · Average checkpoints and apply gates<br/>Physically remove pruned units"]
+    P12 --> C1["pruned/pytorch_model.bin and pruned_config.json<br/>Compact WavLM"]
+    C1 -->|Initialize compact student| P21["Pruning 2-1 · Further distill<br/>Frozen teacher · trainable compact student"]
+    W -->|Initialize the same frozen teacher| P21
+    P21 --> P22["Pruning 2-2 · Average checkpoints<br/>Extract student backbone"]
+    P22 --> C2["avg_student_ckpt/pytorch_model.bin<br/>Further-distilled compact WavLM"]
+
+    A2 -->|Load non-WavLM tensors only| P3["Pruning 3 · Supervised segmentation<br/>Trainable compact WavLM and segmentation head"]
+    C2 -->|Build and initialize compact WavLM| P3
+    P3 -->|Average five selected epochs| FINAL["Full compact segmentation checkpoint<br/>average_05_13_15_18_19"]
+    FINAL --> EVAL["Inference with held-out audio and WeSpeaker<br/>Cluster speaker embeddings"]
+    EVAL --> RTTM["Predicted RTTM speaker turns"]
+
+    classDef training fill:#e2f3eb,stroke:#438565,color:#193d2d
+    classDef checkpoint fill:#eaf0fa,stroke:#607aab,color:#233b62
+    class F1,F2,P11,P21,P3 training
+    class BOOT,A1,A2,W,C1,C2,FINAL checkpoint
+```
+
+Stages **1-2** and **2-2** process checkpoints without gradient updates. They
+select the lowest development-loss checkpoints from the peak development-loss
+epoch onward, including that epoch, with a configurable cap of five by default.
+Stage 1-2 applies the learned gates to shrink the architecture. Stage 2-2
+exports the further-distilled student in the same compact architecture.
+
+### Supervised segmentation model
+
+Full steps 1 and 2 and pruning stage 3 share this forward path. The segmentation
+head includes every learned module from the layer mix through the classifier.
+
+```mermaid
+flowchart TD
+    WAV["DiariZen_all waveform<br/>8 s at 16 kHz · channel 0"] --> WLM["WavLM · 7 convolution layers and 12 Transformer blocks<br/>Dense in full steps 1 and 2 · compact in pruning stage 3"]
+    WLM --> MIX["Learned mix of 13 hidden states<br/>Encoder input and 12 block outputs"]
+    MIX --> PROJ["Linear projection 768 → 256 and LayerNorm"]
+    PROJ --> CONF["4 Conformer blocks<br/>256 hidden width · 4 attention heads"]
+    CONF --> CLS["Linear classifier and powerset activation"]
+    CLS --> SCORES["Output per chunk · 399 frames × 11 class scores<br/>Up to 4 local speaker slots and 2 active speakers per frame"]
+    SCORES --> LOSS["Permutation-aligned powerset negative log-likelihood"]
+    LABEL["RTTM speaker labels<br/>Chunks selected within UEM regions"] --> LOSS
+
+    classDef head fill:#e2f3eb,stroke:#438565,color:#193d2d
+    class MIX,PROJ,CONF,CLS head
+```
+
+The head trains in all three supervised steps. WavLM is frozen in full step 1,
+then updated alongside the head in full step 2 and pruning stage 3.
+
+### WavLM distillation model
+
+```mermaid
+flowchart TD
+    WAV["Same 8 s waveform chunk"] --> T["Dense fine-tuned WavLM teacher<br/>Frozen in stages 1-1 and 2-1"]
+    WAV --> S["WavLM student<br/>1-1 · dense weights and trainable hard-concrete gates<br/>2-1 · compact weights with gates disabled"]
+    T -->|Hidden states 0, 4, 8, 12| D["Feature distillation<br/>L1 error and cosine similarity"]
+    S -->|Hidden states 0, 4, 8, 12| D
+    D --> O["Update student weights in both stages<br/>Also update gates in stage 1-1"]
+    S --> G["Stage 1-1 sparsity regularization<br/>80% target · 5-epoch warmup"]
+    G --> P["Learn gates for convolution channels,<br/>attention heads and feed-forward intermediate units"]
+
+    classDef frozen fill:#eaf0fa,stroke:#607aab,color:#233b62
+    classDef trainable fill:#e2f3eb,stroke:#438565,color:#193d2d
+    class T frozen
+    class S,O,P trainable
+```
+
+The teacher's hidden states provide supervision in both distillation stages. The
+dataset loader reads RTTM and UEM metadata, while the distillation loss uses the
+waveform-derived features.
+
+In the historical run, compaction reduced WavLM from **94.38M to 18.88M
+parameters** and from **144 to 21 attention heads**. The compact backbone
+retains **12 Transformer blocks and a 768-wide output**, so stage 3 can reuse
+the full model's layer mix, projection, normalization, Conformer and classifier.
+
+
 ## 2. Rebuild the environment
 
 ```bash
